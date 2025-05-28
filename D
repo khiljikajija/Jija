@@ -1,0 +1,133 @@
+import os
+import base64
+import streamlit as st
+from openai import AzureOpenAI
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    AnalyzeTextOptions,
+    AnalyzeImageOptions,
+    TextBlocklist,
+    AddOrUpdateTextBlocklistItemsOptions,
+    TextBlocklistItem,
+)
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# Initialize tracing
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+exporter = AzureMonitorTraceExporter.from_connection_string(
+    os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
+)
+span_processor = BatchSpanProcessor(exporter)
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Initialize Azure Content Safety client
+content_safety_client = ContentSafetyClient(
+    endpoint=os.environ["AZURE_CONTENT_SAFETY_ENDPOINT"],
+    credential=AzureKeyCredential(os.environ["AZURE_CONTENT_SAFETY_API_KEY"])
+)
+
+# Initialize Azure OpenAI client
+openai_client = AzureOpenAI(
+    api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    api_version="2024-02-15-preview",
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"]
+)
+
+def analyze_text_content(text):
+    options = AnalyzeTextOptions(text=text)
+    response = content_safety_client.analyze_text(options)
+    return response
+
+def analyze_image_content(image_path):
+    with open(image_path, "rb") as image_file:
+        image_data = base64.b64encode(image_file.read()).decode("utf-8")
+    options = AnalyzeImageOptions(image={"content": image_data})
+    response = content_safety_client.analyze_image(options)
+    return response
+
+def manage_blocklist(blocklist_name, block_items):
+    # Create or update blocklist
+    blocklist = TextBlocklist(description="Sample blocklist")
+    content_safety_client.create_or_update_text_blocklist(blocklist_name, blocklist)
+    # Add or update block items
+    options = AddOrUpdateTextBlocklistItemsOptions(blocklist_items=block_items)
+    content_safety_client.add_or_update_blocklist_items(blocklist_name, options)
+
+def analyze_text_with_blocklist(text, blocklist_name):
+    options = AnalyzeTextOptions(text=text, blocklist_names=[blocklist_name])
+    response = content_safety_client.analyze_text(options)
+    return response
+
+def call_azure_openai_model(prompt):
+    deployment_name = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+    response = openai_client.chat.completions.create(
+        model=deployment_name,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
+
+def main():
+    st.title("Azure OpenAI & Content Safety Streamlit App")
+
+    with tracer.start_as_current_span("user_interaction"):
+        st.header("1. Text Analysis")
+        user_text = st.text_area("Enter text to analyze:")
+        if st.button("Analyze Text"):
+            with tracer.start_as_current_span("analyze_text"):
+                analysis = analyze_text_content(user_text)
+                st.subheader("Content Safety Analysis")
+                for result in analysis.categories_analysis:
+                    st.write(f"Category: {result.category}, Severity: {result.severity}")
+
+        st.header("2. Image Analysis")
+        uploaded_image = st.file_uploader("Upload an image for analysis", type=["jpg", "png"])
+        if uploaded_image and st.button("Analyze Image"):
+            with tracer.start_as_current_span("analyze_image"):
+                image_path = f"temp_{uploaded_image.name}"
+                with open(image_path, "wb") as f:
+                    f.write(uploaded_image.getbuffer())
+                analysis = analyze_image_content(image_path)
+                st.subheader("Content Safety Analysis")
+                for result in analysis.categories_analysis:
+                    st.write(f"Category: {result.category}, Severity: {result.severity}")
+                os.remove(image_path)
+
+        st.header("3. Blocklist Management")
+        blocklist_name = st.text_input("Blocklist Name", value="TestBlocklist")
+        block_items_input = st.text_area("Enter block items (comma-separated):", value="badword1, badword2")
+        if st.button("Create/Update Blocklist"):
+            with tracer.start_as_current_span("manage_blocklist"):
+                block_items = [
+                    TextBlocklistItem(text=item.strip(), description=f"Blocked term: {item.strip()}")
+                    for item in block_items_input.split(",") if item.strip()
+                ]
+                manage_blocklist(blocklist_name, block_items)
+                st.success(f"Blocklist '{blocklist_name}' updated.")
+
+        st.header("4. Analyze Text with Blocklist")
+        text_with_blocklist = st.text_area("Enter text to analyze with blocklist:")
+        if st.button("Analyze with Blocklist"):
+            with tracer.start_as_current_span("analyze_with_blocklist"):
+                analysis = analyze_text_with_blocklist(text_with_blocklist, blocklist_name)
+                st.subheader("Blocklist Analysis")
+                if analysis.blocklists_match:
+                    for match in analysis.blocklists_match:
+                        st.write(f"Matched Block Item: {match.block_item_text} in Blocklist: {match.blocklist_name}")
+                else:
+                    st.write("No matches found in blocklist.")
+
+        st.header("5. Azure OpenAI Model Invocation")
+        prompt = st.text_area("Enter prompt for Azure OpenAI model:")
+        if st.button("Get AI Response"):
+            with tracer.start_as_current_span("azure_openai_response"):
+                response = call_azure_openai_model(prompt)
+                st.subheader("Azure OpenAI Response")
+                st.write(response)
+
+if __name__ == "__main__":
+    main()
