@@ -1,0 +1,475 @@
+import streamlit as st
+import os
+import pandas as pd
+from datetime import datetime
+import json # For REST API payloads and responses
+import requests # For making HTTP requests to Prompt Shield REST API
+
+# Azure SDK imports
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    AnalyzeTextOptions,
+    AnalyzeTextOutputType,
+    TextBlocklist,
+    AddBlocklistItemsOptions,
+    TextBlocklistItem,
+    TextCategory,
+    # SeverityLevel # Import if needed for explicit severity level comparisons
+)
+from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
+from azure.identity import DefaultAzureCredential # Optional: if using AAD for some services
+
+# Using OpenAI SDK for LLM call - adjust if your Foundry deployment differs
+import openai
+
+# For Application Insights logging
+from opentelemetry import trace
+from opentype.sdk.trace import TracerProvider
+from opentype.sdk.trace.export import BatchSpanProcessor
+from opentype.sdk.resources import Resource
+from opentype.semconv.resource import ResourceAttributes
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+from opentype.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentype.propagate import set_global_textmap_propagator
+
+
+# --- Configuration & Clients ---
+def load_env_vars():
+    """Load environment variables."""
+    config = {
+        "content_safety_endpoint": os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
+        "content_safety_key": os.getenv("AZURE_CONTENT_SAFETY_KEY"),
+        "ai_foundry_endpoint": os.getenv("AZURE_AI_FOUNDRY_ENDPOINT"), # e.g., your Azure OpenAI endpoint or other Foundry model endpoint
+        "ai_foundry_key": os.getenv("AZURE_AI_FOUNDRY_KEY"),
+        "ai_foundry_deployment_name": os.getenv("AZURE_AI_FOUNDRY_DEPLOYMENT_NAME", "gpt-4o-mini"), # Default, user should set this
+        "app_insights_connection_string": os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"),
+        "prompt_shield_api_version": os.getenv("PROMPT_SHIELD_API_VERSION", "2024-09-01-preview") # API version for Prompt Shield REST call
+    }
+    critical_vars = ["content_safety_endpoint", "content_safety_key", "ai_foundry_endpoint", "app_insights_connection_string"]
+    if not all(config[var] for var in critical_vars):
+        missing = [var for var in critical_vars if not config[var]]
+        st.error(f"Critical environment variables are missing: {', '.join(missing)}. Please check your setup.")
+        st.stop()
+    return config
+
+CONFIG = load_env_vars()
+
+# Initialize Azure Clients
+try:
+    # Content Safety Client
+    cs_credential = AzureKeyCredential(CONFIG["content_safety_key"])
+    content_safety_client = ContentSafetyClient(CONFIG["content_safety_endpoint"], cs_credential)
+
+    # LLM Client (using OpenAI SDK)
+    # For Azure OpenAI, it should be configured like this:
+    openai.api_type = "azure"
+    openai.api_base = CONFIG["ai_foundry_endpoint"] # Your Azure OpenAI endpoint
+    openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview") # Use an appropriate API version for your model
+    if CONFIG["ai_foundry_key"]:
+        openai.api_key = CONFIG["ai_foundry_key"]
+    else: # Try to use AAD token if key is not provided
+        try:
+            credential = DefaultAzureCredential()
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            openai.api_key = token.token
+            st.info("Using Azure AD token for AI Foundry endpoint.")
+        except Exception as e:
+            st.error(f"AI Foundry Key not provided and failed to get AAD token: {e}")
+            st.stop()
+
+    AI_FOUNDRY_DEPLOYMENT_NAME = CONFIG["ai_foundry_deployment_name"]
+
+except Exception as e:
+    st.error(f"Error initializing Azure clients: {e}")
+    st.stop()
+
+
+# --- Application Insights Setup ---
+def setup_opentelemetry():
+    """Sets up OpenTelemetry for Azure Monitor."""
+    if CONFIG["app_insights_connection_string"]:
+        try:
+            resource = Resource(attributes={
+                ResourceAttributes.SERVICE_NAME: "AICoordinatorTestUI"
+            })
+            trace_provider = TracerProvider(resource=resource)
+            trace.set_tracer_provider(trace_provider)
+            
+            exporter = AzureMonitorTraceExporter(connection_string=CONFIG["app_insights_connection_string"])
+            span_processor = BatchSpanProcessor(exporter)
+            trace_provider.add_span_processor(span_processor)
+            
+            set_global_textmap_propagator(TraceContextTextMapPropagator())
+            
+            tracer = trace.get_tracer(__name__)
+            st.session_state.tracer = tracer
+            print("OpenTelemetry configured for Application Insights.")
+            return tracer
+        except Exception as e:
+            st.warning(f"Could not initialize Application Insights tracer: {e}")
+    else:
+        st.warning("Application Insights connection string not found. Logging will be to console only.")
+    return None
+
+if 'tracer' not in st.session_state:
+    st.session_state.tracer = setup_opentelemetry()
+
+def log_to_app_insights(event_name, properties):
+    """Logs a custom event to Application Insights if tracer is available."""
+    if st.session_state.tracer:
+        with st.session_state.tracer.start_as_current_span(event_name) as span:
+            for key, value in properties.items():
+                # Convert all values to strings to avoid type issues with OTel attributes
+                if isinstance(value, (dict, list)):
+                    try:
+                        span.set_attribute(key, json.dumps(value))
+                    except TypeError:
+                        span.set_attribute(key, str(value)) # Fallback
+                else:
+                    span.set_attribute(key, str(value))
+    else:
+        print(f"App Insights not configured. Event: {event_name}, Properties: {json.dumps(properties, indent=2)}")
+
+# --- Content Safety Functions ---
+
+def manage_blocklist(blocklist_name, description="Managed by Streamlit Test App"):
+    """Creates or ensures a blocklist exists. Returns the blocklist name."""
+    try:
+        # create_or_update_text_blocklist is the correct method in v1.0.0
+        blocklist_resource = content_safety_client.create_or_update_text_blocklist(
+            blocklist_name=blocklist_name,
+            options=TextBlocklist(description=description) # Pass description directly to TextBlocklist constructor
+        )
+        log_to_app_insights("BlocklistManagement", {"action": "create_or_update", "blocklist_name": blocklist_name, "status": "success"})
+        return blocklist_resource.blocklist_name
+    except HttpResponseError as e:
+        st.error(f"Failed to create/update blocklist '{blocklist_name}': {e.message}")
+        log_to_app_insights("BlocklistManagement", {"action": "create_or_update", "blocklist_name": blocklist_name, "status": "failed", "error": str(e)})
+        return None
+    except Exception as e: # Catch other potential errors
+        st.error(f"An unexpected error occurred during blocklist creation/update for '{blocklist_name}': {e}")
+        log_to_app_insights("BlocklistManagement", {"action": "create_or_update", "blocklist_name": blocklist_name, "status": "failed_unexpected", "error": str(e)})
+        return None
+
+
+def add_terms_to_blocklist(blocklist_name, terms_to_add):
+    """Adds terms to a given blocklist using add_blocklist_items."""
+    if not terms_to_add:
+        return
+    try:
+        blocklist_items_to_add = [TextBlocklistItem(text=term) for term in terms_to_add]
+        # Corrected: use AddBlocklistItemsOptions
+        add_options = AddBlocklistItemsOptions(blocklist_items=blocklist_items_to_add)
+        
+        result = content_safety_client.add_blocklist_items(
+            blocklist_name=blocklist_name,
+            options=add_options
+        )
+        # The result of add_blocklist_items is AddBlocklistItemsResult, which contains blocklist_items
+        added_count = len(result.blocklist_items) if result.blocklist_items else 0
+        st.success(f"Added {added_count} terms to blocklist '{blocklist_name}'.")
+        log_to_app_insights("BlocklistManagement", {"action": "add_terms", "blocklist_name": blocklist_name, "term_count": len(terms_to_add), "added_count": added_count, "status": "success"})
+    except HttpResponseError as e:
+        st.error(f"Failed to add terms to blocklist '{blocklist_name}': {e.message}")
+        log_to_app_insights("BlocklistManagement", {"action": "add_terms", "blocklist_name": blocklist_name, "status": "failed", "error": str(e)})
+    except Exception as e: # Catch other potential errors
+        st.error(f"An unexpected error occurred adding terms to blocklist '{blocklist_name}': {e}")
+        log_to_app_insights("BlocklistManagement", {"action": "add_terms", "blocklist_name": blocklist_name, "status": "failed_unexpected", "error": str(e)})
+
+
+def analyze_text_content_safety(text_to_analyze, blocklist_names=None, break_by_blocklist_flag=False):
+    """Analyzes text using Azure AI Content Safety (v1.0.0 compatible)."""
+    request_options = AnalyzeTextOptions(
+        text=text_to_analyze,
+        categories=[
+            TextCategory.HATE, TextCategory.SELF_HARM,
+            TextCategory.SEXUAL, TextCategory.VIOLENCE
+        ],
+        output_type=AnalyzeTextOutputType.SEVERITY_LEVEL
+    )
+    if blocklist_names:
+        request_options.blocklist_names = blocklist_names
+        # Corrected parameter for v1.0.0 SDK: break_by_blocklist
+        request_options.break_by_blocklist = break_by_blocklist_flag
+
+    analysis_result_obj = None
+    try:
+        response = content_safety_client.analyze_text(request_options)
+        analysis_result_obj = {
+            "categories_analysis": [
+                {"category": cat.category, "severity": cat.severity} for cat in response.categories_analysis
+            ] if response.categories_analysis else [],
+            # Corrected response attribute for v1.0.0 SDK: blocklists_match
+            "blocklists_match": [
+                {
+                    "blocklist_name": match.blocklist_name,
+                    "blocklist_item_id": match.blocklist_item_id,
+                    "blocklist_item_text": match.blocklist_item_text
+                }
+                for match in response.blocklists_match # This is a List[TextBlocklistMatch]
+            ] if response.blocklists_match else [],
+        }
+        log_to_app_insights("ContentSafetyAnalysis", {"text_length": len(text_to_analyze), "blocklists_used": bool(blocklist_names), "status": "success"})
+    except HttpResponseError as e:
+        st.error(f"Content Safety analysis failed: {e.message}")
+        analysis_result_obj = {"error": str(e.message)}
+        log_to_app_insights("ContentSafetyAnalysis", {"text_length": len(text_to_analyze), "status": "failed", "error": str(e)})
+    except Exception as e: # Catch other potential errors
+        st.error(f"An unexpected error occurred during Content Safety analysis: {e}")
+        analysis_result_obj = {"error": str(e)}
+        log_to_app_insights("ContentSafetyAnalysis", {"text_length": len(text_to_analyze), "status": "failed_unexpected", "error": str(e)})
+    return analysis_result_obj
+
+def analyze_with_prompt_shield_rest(user_prompt, documents=None):
+    """
+    Analyzes a user prompt and optional documents for attacks using Prompt Shields via REST API.
+    (This function remains a REST call as Prompt Shield is not yet in the SDK)
+    """
+    log_to_app_insights("PromptShieldAnalysisREST_Attempt", {"user_prompt_length": len(user_prompt), "doc_count": len(documents) if documents else 0})
+
+    shield_endpoint_url = f"{CONFIG['content_safety_endpoint'].rstrip('/')}/contentsafety/text:shieldPrompt?api-version={CONFIG['prompt_shield_api_version']}"
+    headers = {
+        "Ocp-Apim-Subscription-Key": CONFIG['content_safety_key'],
+        "Content-Type": "application/json"
+    }
+    payload = {"userPrompt": user_prompt}
+    if documents: # documents should be a list of strings
+        payload["documents"] = documents
+
+    try:
+        response = requests.post(shield_endpoint_url, headers=headers, json=payload, timeout=30) # Added timeout
+        response.raise_for_status()
+        result = response.json()
+        log_to_app_insights("PromptShieldAnalysisREST_Success", {"status": "success", "response_keys": list(result.keys()) if isinstance(result, dict) else "N/A"})
+        return result
+    except requests.exceptions.Timeout:
+        st.error(f"Prompt Shield REST API call timed out.")
+        log_to_app_insights("PromptShieldAnalysisREST_Failure", {"status": "failed", "error": "Timeout"})
+        return {"error": "Timeout"}
+    except requests.exceptions.HTTPError as http_err:
+        error_content = http_err.response.text if http_err.response else "No response body"
+        st.error(f"Prompt Shield REST API call failed with HTTPError: {http_err} - {error_content}")
+        log_to_app_insights("PromptShieldAnalysisREST_Failure", {"status": "failed", "error_code": http_err.response.status_code if http_err.response else 'N/A', "error_message": str(http_err), "error_content": error_content})
+        return {"error": str(http_err), "details": error_content}
+    except requests.exceptions.RequestException as e:
+        st.error(f"Prompt Shield REST API call failed: {e}")
+        log_to_app_insights("PromptShieldAnalysisREST_Failure", {"status": "failed", "error": str(e)})
+        return {"error": str(e)}
+    except Exception as e: # Catch other potential errors like JSON parsing
+        st.error(f"An unexpected error occurred during Prompt Shield REST call: {e}")
+        log_to_app_insights("PromptShieldAnalysisREST_Failure", {"status": "failed_unexpected", "error": str(e)})
+        return {"error": str(e)}
+
+
+# --- LLM Call Function ---
+def call_ai_foundry_llm(prompt_text_for_llm):
+    """Calls the deployed LLM in AI Foundry."""
+    completion_text = ""
+    full_response_str = None
+    try:
+        response = openai.ChatCompletion.create( # For older openai SDK versions < 1.0
+        # For openai SDK >= 1.0, it would be:
+        # response = client.chat.completions.create(
+            engine=AI_FOUNDRY_DEPLOYMENT_NAME,  # Use 'engine' for Azure OpenAI with older SDK, or 'model' for newer
+            # model=AI_FOUNDRY_DEPLOYMENT_NAME, # Use 'model' for newer openai SDK versions >= 1.0
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt_text_for_llm}
+            ],
+            max_tokens=800, # Increased for potentially longer outputs
+            temperature=0.7
+        )
+        completion_text = response.choices[0].message.content.strip()
+        # For openai SDK >= 1.0, it would be:
+        # full_response_str = response.model_dump_json(indent=2)
+        full_response_str = json.dumps(response.to_dict(), indent=2) # For older openai SDK
+        log_to_app_insights("LLMCall", {"prompt_length": len(prompt_text_for_llm), "completion_length": len(completion_text), "model": AI_FOUNDRY_DEPLOYMENT_NAME, "status": "success"})
+    except Exception as e:
+        st.error(f"LLM call failed: {e}")
+        completion_text = f"Error: {e}"
+        log_to_app_insights("LLMCall", {"prompt_length": len(prompt_text_for_llm), "model": AI_FOUNDRY_DEPLOYMENT_NAME, "status": "failed", "error": str(e)})
+    return prompt_text_for_llm, completion_text, full_response_str
+
+# --- Streamlit UI ---
+st.set_page_config(layout="wide")
+st.title("🛡️ Azure AI Content Safety & Foundry Test UI 🧪 (SDK v1.0.0)")
+
+# Display Endpoints and configurations
+with st.expander("Configuration Details", expanded=False):
+    st.markdown(f"**Content Safety Endpoint:** `{CONFIG['content_safety_endpoint']}`")
+    st.markdown(f"**AI Foundry Endpoint:** `{CONFIG['ai_foundry_endpoint']}`")
+    st.markdown(f"**AI Foundry Deployment:** `{AI_FOUNDRY_DEPLOYMENT_NAME}`")
+    st.markdown(f"**OpenAI API Version (for LLM):** `{openai.api_version}`")
+    st.markdown(f"**Prompt Shield REST API Version:** `{CONFIG['prompt_shield_api_version']}`")
+    st.markdown(f"**Application Insights Logging:** `{'Enabled' if st.session_state.tracer else 'Disabled'}`")
+
+
+# --- Blocklist Management UI ---
+with st.sidebar:
+    st.header("Blocklist Management")
+    blocklist_name_input = st.text_input("Blocklist Name", value="my-test-blocklist", key="blocklist_name_input_key")
+    if st.button("Create/Ensure Blocklist Exists"):
+        if blocklist_name_input:
+            created_blocklist_name = manage_blocklist(blocklist_name_input)
+            if created_blocklist_name:
+                st.session_state.current_blocklist = created_blocklist_name
+                st.success(f"Blocklist '{created_blocklist_name}' is ready.")
+        else:
+            st.warning("Please provide a blocklist name.")
+
+
+    if 'current_blocklist' in st.session_state and st.session_state.current_blocklist:
+        st.write(f"Current active blocklist: **{st.session_state.current_blocklist}**")
+        terms_to_add_str = st.text_area("Terms to add (comma-separated)", placeholder="e.g., unwanted_term1, another_term", key="terms_to_add_key")
+        if st.button("Add Terms to Blocklist"):
+            if terms_to_add_str:
+                terms = [term.strip() for term in terms_to_add_str.split(',') if term.strip()]
+                add_terms_to_blocklist(st.session_state.current_blocklist, terms)
+            else:
+                st.warning("Please enter terms to add.")
+    else:
+        st.info("Create or specify a blocklist to add terms.")
+
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.header("Input Prompt")
+    user_prompt = st.text_area("Enter your prompt for the LLM:", height=150, key="user_prompt_input")
+
+    st.subheader("Content Safety Options")
+    enable_prompt_cs = st.checkbox("Analyze Prompt with Content Safety (Categories/Blocklist)", value=False, key="prompt_cs_cb")
+    enable_completion_cs = st.checkbox("Analyze Completion with Content Safety (Categories/Blocklist)", value=True, key="completion_cs_cb")
+    
+    use_blocklist_for_cs = False
+    selected_blocklist_for_cs = None
+    if enable_prompt_cs or enable_completion_cs:
+        use_blocklist_for_cs = st.checkbox("Use Blocklist for Content Safety Analysis", value=False, key="use_blocklist_cs_cb")
+        if use_blocklist_for_cs:
+            if 'current_blocklist' in st.session_state and st.session_state.current_blocklist:
+                selected_blocklist_for_cs = st.session_state.current_blocklist
+                st.info(f"Using blocklist for CS: {selected_blocklist_for_cs}")
+            else:
+                st.warning("No active blocklist for CS. Create one or disable blocklist check.")
+                use_blocklist_for_cs = False # Disable if no blocklist is active
+        break_on_blocklist = st.checkbox("Break by Blocklist (Halt analysis if blocklist item hit)", value=False, key="break_blocklist_cb") if use_blocklist_for_cs else False
+
+    use_prompt_shield = st.checkbox("Enable Prompt Shield Analysis (via REST API)", value=False, key="prompt_shield_cb")
+    document_for_shield_str = ""
+    if use_prompt_shield:
+        document_for_shield_str = st.text_area("Enter grounding documents for Prompt Shield (one per line, optional):", height=100, key="prompt_shield_doc")
+
+    if st.button("🚀 Analyze Prompt & Call LLM", type="primary", key="main_action_button"):
+        if not user_prompt.strip():
+            st.warning("Please enter a prompt.")
+        else:
+            st.session_state.results = {} # Clear previous results
+            request_timestamp = datetime.utcnow().isoformat() + "Z"
+
+            # 1. Analyze Prompt with Content Safety (Optional - before LLM)
+            if enable_prompt_cs:
+                st.subheader("📝 Prompt Analysis (Content Safety)")
+                prompt_cs_blocklists_to_use = [selected_blocklist_for_cs] if use_blocklist_for_cs and selected_blocklist_for_cs else None
+                prompt_cs_results = analyze_text_content_safety(user_prompt, prompt_cs_blocklists_to_use, break_on_blocklist)
+                st.session_state.results["prompt_content_safety_analysis"] = prompt_cs_results
+                st.json(prompt_cs_results)
+
+            # 2. Analyze Prompt with Prompt Shield (Optional - before LLM)
+            if use_prompt_shield:
+                st.subheader("🛡️ Prompt Shield Analysis (REST API)")
+                shield_docs_list = [doc.strip() for doc in document_for_shield_str.split("\n") if doc.strip()] if document_for_shield_str else None
+                prompt_shield_results = analyze_with_prompt_shield_rest(user_prompt, shield_docs_list)
+                st.session_state.results["prompt_shield_analysis"] = prompt_shield_results
+                st.json(prompt_shield_results) # Display raw JSON from REST API
+
+            # 3. Call LLM
+            st.subheader("💬 LLM Interaction")
+            llm_prompt, llm_completion, llm_full_response = call_ai_foundry_llm(user_prompt)
+            st.session_state.results["llm_prompt"] = llm_prompt
+            st.session_state.results["llm_completion"] = llm_completion
+            st.markdown("**LLM Prompt:**")
+            st.text(llm_prompt)
+            st.markdown("**LLM Completion:**")
+            st.text_area("Completion Output", value=llm_completion, height=200, disabled=True, key="llm_output_display")
+
+            # 4. Analyze Completion with Content Safety
+            if enable_completion_cs:
+                st.subheader("✅ Completion Analysis (Content Safety)")
+                if llm_completion and not llm_completion.startswith("Error:"):
+                    completion_cs_blocklists_to_use = [selected_blocklist_for_cs] if use_blocklist_for_cs and selected_blocklist_for_cs else None
+                    completion_cs_results = analyze_text_content_safety(llm_completion, completion_cs_blocklists_to_use, break_on_blocklist)
+                    st.session_state.results["completion_content_safety_analysis"] = completion_cs_results
+                    st.json(completion_cs_results)
+                else:
+                    st.warning("Skipping completion content safety analysis due to LLM error or empty completion.")
+                    st.session_state.results["completion_content_safety_analysis"] = {"status": "skipped"}
+
+            # 5. Log everything
+            final_log_payload = {
+                "timestamp": request_timestamp,
+                "user_prompt": llm_prompt,
+                "llm_completion": llm_completion,
+                "llm_model_name": AI_FOUNDRY_DEPLOYMENT_NAME,
+                # "llm_raw_response_summary": llm_full_response[:1000] if llm_full_response else None, # Log a summary
+                "options_used": {
+                    "prompt_cs_enabled": enable_prompt_cs,
+                    "completion_cs_enabled": enable_completion_cs,
+                    "blocklist_for_cs_enabled": use_blocklist_for_cs,
+                    "selected_blocklist_for_cs": selected_blocklist_for_cs if use_blocklist_for_cs else "N/A",
+                    "break_by_blocklist": break_on_blocklist if use_blocklist_for_cs else False,
+                    "prompt_shield_enabled": use_prompt_shield
+                },
+                "results_summary": {
+                    "prompt_cs_categories_count": len(st.session_state.results.get("prompt_content_safety_analysis", {}).get("categories_analysis", [])),
+                    "prompt_cs_blocklist_hits": len(st.session_state.results.get("prompt_content_safety_analysis", {}).get("blocklists_match", [])),
+                    "prompt_shield_detected_attack": st.session_state.results.get("prompt_shield_analysis", {}).get("userPromptAnalysis", {}).get("attackDetected", "N/A_or_Error"),
+                    "completion_cs_categories_count": len(st.session_state.results.get("completion_content_safety_analysis", {}).get("categories_analysis", [])),
+                    "completion_cs_blocklist_hits": len(st.session_state.results.get("completion_content_safety_analysis", {}).get("blocklists_match", [])),
+                },
+                # Including full details can make logs large, consider if needed
+                # "prompt_content_safety_analysis": st.session_state.results.get("prompt_content_safety_analysis"),
+                # "prompt_shield_analysis": st.session_state.results.get("prompt_shield_analysis"),
+                # "completion_content_safety_analysis": st.session_state.results.get("completion_content_safety_analysis"),
+            }
+            log_to_app_insights("AICoordinatorTestRun_V2", final_log_payload)
+            st.success("All selected operations complete. Results logged.")
+
+
+with col2:
+    st.header("📊 Results & Logs Display")
+    if 'results' in st.session_state and st.session_state.results:
+        if "prompt_content_safety_analysis" in st.session_state.results:
+            st.subheader("Prompt Content Safety Details")
+            res = st.session_state.results["prompt_content_safety_analysis"]
+            if "categories_analysis" in res and res["categories_analysis"]:
+                st.write("Categories Analysis:")
+                st.table(pd.DataFrame(res["categories_analysis"]))
+            if "blocklists_match" in res and res["blocklists_match"]:
+                st.write("Blocklist Hits:")
+                st.json(res["blocklists_match"])
+            if "error" in res:
+                st.error(f"Prompt CS Error: {res['error']}")
+
+        if "prompt_shield_analysis" in st.session_state.results:
+            st.subheader("Prompt Shield REST API Response")
+            st.json(st.session_state.results["prompt_shield_analysis"])
+
+        if "completion_content_safety_analysis" in st.session_state.results:
+            st.subheader("Completion Content Safety Details")
+            res = st.session_state.results["completion_content_safety_analysis"]
+            if "categories_analysis" in res and res["categories_analysis"]:
+                st.write("Categories Analysis:")
+                st.table(pd.DataFrame(res["categories_analysis"]))
+            if "blocklists_match" in res and res["blocklists_match"]:
+                st.write("Blocklist Hits:")
+                st.json(res["blocklists_match"])
+            if "error" in res:
+                st.error(f"Completion CS Error: {res['error']}")
+            if res.get("status") == "skipped":
+                st.info("Completion Content Safety was skipped.")
+    else:
+        st.info("Run an analysis to see results here.")
+
+st.markdown("---")
+st.caption("Ensure all necessary Azure resources are configured and environment variables are set. Refresh the page if you change environment variables after starting the app.")
