@@ -1,0 +1,89 @@
+import streamlit as st
+from azure.ai.generative import GenerativeClient
+from azure.content_safety import ContentSafetyClient
+from azure.content_safety.models import (
+    AnalyzeTextOptions,
+    AnalyzeImageOptions,
+    AnalyzePromptOptions,
+    BlocklistMatchOptions
+)
+from azure.identity import AzureKeyCredential
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from PIL import Image
+import io
+
+# --- Azure Config ---
+AZURE_FOUNDRY_ENDPOINT = "https://<your-foundry-endpoint>.openai.azure.com"
+AZURE_FOUNDRY_API_KEY = "<your-foundry-api-key>"
+AZURE_FOUNDRY_DEPLOYMENT = "<your-foundry-deployment-name>"
+
+CONTENT_SAFETY_ENDPOINT = "https://<your-content-safety-endpoint>.cognitiveservices.azure.com"
+CONTENT_SAFETY_API_KEY = "<your-content-safety-api-key>"
+
+APPINSIGHTS_CONNECTION_STRING = "InstrumentationKey=<your-key>;IngestionEndpoint=https://<region>.in.applicationinsights.azure.com/"
+
+# --- Init Clients ---
+cs_client = ContentSafetyClient(CONTENT_SAFETY_ENDPOINT, AzureKeyCredential(CONTENT_SAFETY_API_KEY))
+gen_client = GenerativeClient(AZURE_FOUNDRY_ENDPOINT, credential=AzureKeyCredential(AZURE_FOUNDRY_API_KEY))
+
+# --- App Insights setup ---
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(AzureMonitorTraceExporter(connection_string=APPINSIGHTS_CONNECTION_STRING))
+)
+tracer = trace.get_tracer(__name__)
+
+# --- UI Layout ---
+st.title("🔐 Azure AI Foundry + Content Safety + Monitoring")
+
+prompt = st.text_area("Enter prompt for LLM", height=200)
+check_safety = st.checkbox("Analyze prompt for safety, blocklists, and shields")
+image_file = st.file_uploader("Upload image for content safety scan", type=["png", "jpg", "jpeg"])
+
+if st.button("Run LLM and Safety Tests") and prompt:
+    with tracer.start_as_current_span("prompt-analysis"):
+        if check_safety:
+            st.subheader("🛡️ Prompt Content Safety")
+            result = cs_client.analyze_text(AnalyzeTextOptions(text=prompt))
+            st.json(result.as_dict())
+
+            st.subheader("🛑 Blocklist Check")
+            blocklist_result = cs_client.check_text_blocklist(
+                BlocklistMatchOptions(text=prompt)
+            )
+            st.json(blocklist_result.as_dict())
+
+            st.subheader("🧱 Prompt Shield (jailbreak detection)")
+            shield_result = cs_client.analyze_prompt(AnalyzePromptOptions(prompt=prompt))
+            st.json(shield_result.as_dict())
+
+    # LLM Call
+    with tracer.start_as_current_span("llm-call"):
+        st.subheader("🤖 Azure Foundry Response")
+        response = gen_client.get_chat_completions(
+            deployment_id=AZURE_FOUNDRY_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        output = response.choices[0].message.content
+        st.write(output)
+
+    # Analyze Output
+    with tracer.start_as_current_span("output-analysis"):
+        st.subheader("🛡️ Output Content Safety")
+        output_check = cs_client.analyze_text(AnalyzeTextOptions(text=output))
+        st.json(output_check.as_dict())
+
+    # Optional Image Check
+    if image_file:
+        with tracer.start_as_current_span("image-analysis"):
+            st.subheader("🖼️ Image Content Safety")
+            image = Image.open(image_file)
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            image_bytes = buffered.getvalue()
+
+            result = cs_client.analyze_image(AnalyzeImageOptions(image_data=image_bytes))
+            st.json(result.as_dict())
