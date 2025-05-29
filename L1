@@ -1,0 +1,134 @@
+import os
+import json
+import base64
+import streamlit as st
+
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    AnalyzeTextOptions,
+    AddOrUpdateTextBlocklistItemsOptions,
+    RemoveTextBlocklistItemsOptions,
+    TextBlocklistItem,
+)
+from azure.ai.resources.chat import ChatClient
+
+# Telemetry - OpenTelemetry for App Insights
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+
+# ENV variables
+CONTENT_SAFETY_ENDPOINT = os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+CONTENT_SAFETY_KEY = os.getenv("AZURE_CONTENT_SAFETY_KEY")
+FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT")
+FOUNDRY_KEY = os.getenv("AZURE_FOUNDRY_API_KEY")
+FOUNDRY_DEPLOYMENT_NAME = os.getenv("AZURE_FOUNDRY_DEPLOYMENT_NAME")
+APPINSIGHTS_KEY = os.getenv("APPINSIGHTS_INSTRUMENTATIONKEY")
+
+# OpenTelemetry setup
+resource = Resource(attributes={"service.name": "azure-content-safety-streamlit"})
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+exporter = AzureMonitorTraceExporter.from_connection_string(
+    f"InstrumentationKey={APPINSIGHTS_KEY}"
+)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
+
+# Azure SDK clients
+cs_client = ContentSafetyClient(
+    endpoint=CONTENT_SAFETY_ENDPOINT,
+    credential=AzureKeyCredential(CONTENT_SAFETY_KEY),
+)
+
+chat_client = ChatClient(
+    endpoint=FOUNDRY_ENDPOINT,
+    credential=AzureKeyCredential(FOUNDRY_KEY),
+)
+
+# UI Setup
+st.set_page_config(page_title="Azure Foundry + Content Safety", layout="wide")
+st.title("🛡️ Azure AI Content Safety + Foundry Playground")
+
+# Inputs
+st.sidebar.header("Inputs")
+prompt = st.sidebar.text_area("LLM Prompt", height=200)
+source_doc = st.sidebar.text_area("Source Text (for groundedness check)", height=100)
+blocklist_name = st.sidebar.text_input("Blocklist Name")
+words_to_add = st.sidebar.text_area("Blocklist Words (comma-separated)")
+item_ids_to_remove = st.sidebar.text_area("Blocklist Item IDs to Remove (comma-separated)")
+uploaded_image = st.sidebar.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+
+# Utilities
+def run_llm(prompt_text):
+    result = chat_client.complete(
+        deployment=FOUNDRY_DEPLOYMENT_NAME,
+        messages=[{"role": "user", "content": prompt_text}],
+        max_tokens=200,
+    )
+    return result.choices[0].message.content.strip()
+
+def analyze_text_content(text):
+    return cs_client.analyze_text(AnalyzeTextOptions(text=text))
+
+def analyze_image_content(image_bytes):
+    encoded = base64.b64encode(image_bytes).decode()
+    return cs_client.analyze_image({"image": encoded})
+
+def add_blocklist(blocklist_name, words):
+    items = [TextBlocklistItem(text=w) for w in words]
+    options = AddOrUpdateTextBlocklistItemsOptions(blocklist_name=blocklist_name, items=items)
+    return cs_client.add_or_update_text_blocklist_items(options)
+
+def remove_blocklist(blocklist_name, item_ids):
+    options = RemoveTextBlocklistItemsOptions(blocklist_name=blocklist_name, item_ids=item_ids)
+    return cs_client.remove_text_blocklist_items(options)
+
+def check_groundedness(response, source):
+    return response.strip() in source
+
+# Execution
+if st.sidebar.button("Run Analysis"):
+    with tracer.start_as_current_span("azure_content_safety_run"):
+        if prompt:
+            st.subheader("📥 Prompt")
+            st.code(prompt)
+
+            st.subheader("🔍 Prompt Safety Check")
+            result = analyze_text_content(prompt)
+            st.json(result)
+
+            st.subheader("🤖 Foundry LLM Response")
+            reply = run_llm(prompt)
+            st.code(reply)
+
+            st.subheader("🛡️ Response Safety Check")
+            reply_safety = analyze_text_content(reply)
+            st.json(reply_safety)
+
+            if source_doc:
+                grounded = check_groundedness(reply, source_doc)
+                st.success(f"✅ Grounded: {grounded}")
+            else:
+                st.info("⚠️ Groundedness check skipped (no source doc).")
+
+        if uploaded_image:
+            st.subheader("🖼️ Image Moderation")
+            image_bytes = uploaded_image.read()
+            st.image(image_bytes)
+            result = analyze_image_content(image_bytes)
+            st.json(result)
+
+        if blocklist_name and words_to_add:
+            words = [w.strip() for w in words_to_add.split(",") if w.strip()]
+            result = add_blocklist(blocklist_name, words)
+            st.success(f"✅ Added to blocklist '{blocklist_name}'")
+            st.json(result)
+
+        if blocklist_name and item_ids_to_remove:
+            ids = [i.strip() for i in item_ids_to_remove.split(",") if i.strip()]
+            result = remove_blocklist(blocklist_name, ids)
+            st.success(f"✅ Removed from blocklist '{blocklist_name}'")
+            st.json(result)
