@@ -1,0 +1,176 @@
+import os
+import streamlit as st
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    TextBlocklistItem,
+    AddOrUpdateTextBlocklistItemsOptions,
+    RemoveTextBlocklistItemsOptions
+)
+from azure.ai.inference import InferenceClient
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+from PIL import Image
+
+# Setup tracing for Application Insights
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+exporter = AzureMonitorTraceExporter.from_connection_string(
+    os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")
+)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
+
+# Clients
+cs_client = ContentSafetyClient(
+    endpoint=os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT"),
+    credential=AzureKeyCredential(os.getenv("AZURE_CONTENT_SAFETY_KEY"))
+)
+
+inference_client = InferenceClient(
+    endpoint=os.getenv("AZURE_FOUNDRY_ENDPOINT"),
+    credential=AzureKeyCredential(os.getenv("AZURE_FOUNDRY_API_KEY"))
+)
+
+blocklist_id = os.getenv("BLOCKLIST_ID", "default-blocklist")
+
+st.title("🛡️ Azure Foundry + Content Safety Test Suite")
+
+# Prompt input
+st.header("🔐 Prompt Shield & LLM Call")
+prompt = st.text_area("User Prompt")
+
+if st.button("Shield Prompt"):
+    with tracer.start_as_current_span("prompt_shielding"):
+        try:
+            result = cs_client.analyze_text({
+                "text": prompt
+            })
+            st.subheader("Shielding Result")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Prompt shield error: {e}")
+
+if st.button("Call Foundry LLM"):
+    with tracer.start_as_current_span("llm_call"):
+        try:
+            resp = inference_client.infer(model="your-model-name", input={"prompt": prompt})
+            output = resp.get("output", "")
+            st.subheader("LLM Output")
+            st.write(output)
+        except Exception as e:
+            st.error(f"LLM call error: {e}")
+
+# Moderation on prompt or output
+st.header("🧹 Text Moderation")
+text_to_moderate = st.text_area("Text to moderate", value=prompt)
+if st.button("Moderate Text"):
+    with tracer.start_as_current_span("text_moderation"):
+        try:
+            result = cs_client.analyze_text({"text": text_to_moderate})
+            st.subheader("Moderation Result")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Text moderation error: {e}")
+
+# Image moderation
+st.header("🖼️ Image Moderation")
+image = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
+if image and st.button("Moderate Image"):
+    with tracer.start_as_current_span("image_moderation"):
+        try:
+            result = cs_client.analyze_image({"image": image.read()})
+            st.subheader("Image Moderation Result")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Image moderation error: {e}")
+
+# Blocklist Management
+st.header("📛 Blocklist Management")
+
+# Add to blocklist
+word = st.text_input("Blocklist Word")
+desc = st.text_input("Optional Description")
+if st.button("Add to Blocklist"):
+    try:
+        item = TextBlocklistItem(text=word, description=desc)
+        cs_client.add_or_update_text_blocklist_items(
+            AddOrUpdateTextBlocklistItemsOptions(
+                blocklist_id=blocklist_id,
+                blocklist_items=[item]
+            )
+        )
+        st.success(f"'{word}' added.")
+    except Exception as e:
+        st.error(f"Add error: {e}")
+
+# Match blocklist
+text_match = st.text_area("Text to match against blocklist")
+if st.button("Check Blocklist Match"):
+    try:
+        result = cs_client.match_text_blocklist({
+            "blocklist_id": blocklist_id,
+            "text": text_match
+        })
+        st.subheader("Match Result")
+        st.json(result.as_dict())
+    except Exception as e:
+        st.error(f"Match error: {e}")
+
+# Remove blocklist item
+item_id = st.text_input("Blocklist Item ID to Remove")
+if st.button("Remove from Blocklist"):
+    try:
+        cs_client.remove_text_blocklist_items(
+            RemoveTextBlocklistItemsOptions(
+                blocklist_id=blocklist_id,
+                blocklist_item_ids=[item_id]
+            )
+        )
+        st.success(f"Removed: {item_id}")
+    except Exception as e:
+        st.error(f"Remove error: {e}")
+
+# List blocklist
+if st.button("List Blocklist Items"):
+    try:
+        items = cs_client.get_text_blocklist_items(blocklist_id)
+        st.subheader("Blocklist Items")
+        st.json(items.as_dict())
+    except Exception as e:
+        st.error(f"List error: {e}")
+
+# Groundedness Check
+st.header("🔍 Groundedness Check")
+
+context = st.text_area("Grounding Context (Source)", height=150)
+candidate = st.text_area("LLM Output to Verify", height=150)
+
+if st.button("Run Groundedness Check"):
+    with tracer.start_as_current_span("groundedness_check"):
+        try:
+            result = cs_client.analyze_text({
+                "text": candidate,
+                "context": context
+            })
+            st.subheader("Groundedness Analysis")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Groundedness check error: {e}")
+
+# Protected Material Detection
+st.header("🛡️ Protected Material Detection")
+
+protected_text = st.text_area("Text to check for protected material", height=150)
+
+if st.button("Check Protected Material"):
+    with tracer.start_as_current_span("protected_material_detection"):
+        try:
+            result = cs_client.analyze_text({
+                "text": protected_text
+            })
+            st.subheader("Protected Material Detection Result")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Protected material detection error: {e}")
