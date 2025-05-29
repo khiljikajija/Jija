@@ -1,0 +1,127 @@
+import os
+import json
+import base64
+import streamlit as st
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    AnalyzeTextOptions,
+    TextBlocklistItem,
+    AddOrUpdateTextBlocklistItemsOptions,
+    RemoveTextBlocklistItemsOptions,
+)
+from azure.ai.resources.chat import ChatClient
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry import trace
+from opentelemetry.trace import get_tracer
+
+# Configure telemetry
+configure_azure_monitor()
+tracer = get_tracer(__name__)
+
+# Load environment variables
+CONTENT_SAFETY_ENDPOINT = os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+CONTENT_SAFETY_KEY = os.getenv("AZURE_CONTENT_SAFETY_KEY")
+FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT")
+FOUNDRY_API_KEY = os.getenv("AZURE_FOUNDRY_API_KEY")
+FOUNDRY_DEPLOYMENT_NAME = os.getenv("AZURE_FOUNDRY_DEPLOYMENT_NAME")
+
+# Azure SDK Clients
+cs_client = ContentSafetyClient(
+    endpoint=CONTENT_SAFETY_ENDPOINT,
+    credential=AzureKeyCredential(CONTENT_SAFETY_KEY),
+)
+chat_client = ChatClient(
+    endpoint=FOUNDRY_ENDPOINT,
+    credential=AzureKeyCredential(FOUNDRY_API_KEY),
+)
+
+# Utility functions
+def call_llm(prompt: str) -> str:
+    response = chat_client.complete(
+        deployment=FOUNDRY_DEPLOYMENT_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+    )
+    return response.choices[0].message.content.strip()
+
+def analyze_text(text: str):
+    return cs_client.analyze_text(AnalyzeTextOptions(text=text))
+
+def analyze_image(image_bytes: bytes):
+    encoded = base64.b64encode(image_bytes).decode()
+    return cs_client.analyze_image({"image": encoded})
+
+def add_blocklist_items(blocklist_name: str, words: list[str]):
+    items = [TextBlocklistItem(text=word) for word in words]
+    options = AddOrUpdateTextBlocklistItemsOptions(blocklist_name=blocklist_name, items=items)
+    return cs_client.add_or_update_text_blocklist_items(options)
+
+def remove_blocklist_items(blocklist_name: str, item_ids: list[str]):
+    options = RemoveTextBlocklistItemsOptions(blocklist_name=blocklist_name, item_ids=item_ids)
+    return cs_client.remove_text_blocklist_items(options)
+
+def groundedness_check(response: str, source: str) -> bool:
+    return response.strip() in source
+
+# Streamlit UI
+st.set_page_config(page_title="Azure AI Foundry & Content Safety", layout="wide")
+st.title("🛡️ Azure AI Foundry + Content Safety Playground")
+
+st.sidebar.header("Inputs")
+prompt = st.sidebar.text_area("LLM Prompt", height=200)
+source_doc = st.sidebar.text_area("Source Text (for groundedness check)", height=100)
+blocklist_name = st.sidebar.text_input("Blocklist Name")
+words_to_add = st.sidebar.text_area("Words to Add (comma-separated)")
+item_ids_to_remove = st.sidebar.text_area("Blocklist Item IDs to Remove (comma-separated)")
+uploaded_image = st.sidebar.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+
+if st.sidebar.button("Run Tests"):
+    with tracer.start_as_current_span("content_safety_test_run") as span:
+        if prompt:
+            st.subheader("📥 Prompt")
+            st.code(prompt)
+
+            st.subheader("🔍 Prompt Safety Analysis")
+            prompt_analysis = analyze_text(prompt)
+            st.json(prompt_analysis)
+
+            st.subheader("🤖 LLM Response")
+            llm_response = call_llm(prompt)
+            st.code(llm_response)
+
+            st.subheader("📊 Response Safety Analysis")
+            response_analysis = analyze_text(llm_response)
+            st.json(response_analysis)
+
+            if source_doc:
+                grounded = groundedness_check(llm_response, source_doc)
+                st.success(f"✅ Grounded: {grounded}")
+            else:
+                grounded = "Not checked"
+
+            # Log to Application Insights
+            span.set_attribute("user.prompt", prompt)
+            span.set_attribute("llm.response", llm_response)
+            span.set_attribute("groundedness", grounded)
+            span.set_attribute("prompt.analysis", str(prompt_analysis))
+            span.set_attribute("response.analysis", str(response_analysis))
+
+        if uploaded_image:
+            st.subheader("🖼️ Image Moderation")
+            image_bytes = uploaded_image.read()
+            result = analyze_image(image_bytes)
+            st.image(image_bytes)
+            st.json(result)
+
+        if blocklist_name and words_to_add:
+            words = [w.strip() for w in words_to_add.split(",") if w.strip()]
+            result = add_blocklist_items(blocklist_name, words)
+            st.success(f"✅ Added words to blocklist '{blocklist_name}'")
+            st.json(result)
+
+        if blocklist_name and item_ids_to_remove:
+            ids = [i.strip() for i in item_ids_to_remove.split(",") if i.strip()]
+            result = remove_blocklist_items(blocklist_name, ids)
+            st.success(f"✅ Removed items from blocklist '{blocklist_name}'")
+            st.json(result)
