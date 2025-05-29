@@ -1,0 +1,140 @@
+import os
+import streamlit as st
+from io import BytesIO
+from PIL import Image
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    AnalyzeTextOptions,
+    AnalyzeImageOptions,
+    AddOrUpdateTextBlocklistItemsOptions,
+    RemoveTextBlocklistItemsOptions,
+    TextBlocklistItem,
+)
+from azure.identity import DefaultAzureCredential
+from azure.ai.foundation import FoundryClient
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+
+# --- Environment Variables ---
+CONTENT_SAFETY_ENDPOINT = os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+CONTENT_SAFETY_KEY = os.getenv("AZURE_CONTENT_SAFETY_KEY")
+APPINSIGHTS_CONN_STRING = os.getenv("APPINSIGHTS_INSTRUMENTATIONKEY")
+FOUNDRY_ENDPOINT = os.getenv("AZURE_FOUNDRY_ENDPOINT")
+FOUNDRY_DEPLOYMENT = os.getenv("AZURE_FOUNDRY_DEPLOYMENT_NAME")
+
+# --- Tracing Setup ---
+trace.set_tracer_provider(
+    TracerProvider(resource=Resource.create({"service.name": "content-safety-ui"}))
+)
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(AzureMonitorTraceExporter.from_connection_string(APPINSIGHTS_CONN_STRING))
+)
+tracer = trace.get_tracer(__name__)
+
+# --- Clients ---
+cs_client = ContentSafetyClient(endpoint=CONTENT_SAFETY_ENDPOINT, credential=AzureKeyCredential(CONTENT_SAFETY_KEY))
+foundry_client = FoundryClient(endpoint=FOUNDRY_ENDPOINT, credential=DefaultAzureCredential())
+
+# --- Streamlit UI ---
+st.title("Azure Content Safety & Foundry UI")
+
+option = st.sidebar.radio("Choose a test", [
+    "Text Moderation",
+    "Image Moderation",
+    "Prompt Shield",
+    "Groundedness Check",
+    "Add to Blocklist",
+    "Remove from Blocklist",
+    "Call Foundry LLM"
+])
+
+def log_trace(name, input_text, output_text):
+    with tracer.start_as_current_span(name) as span:
+        span.set_attribute("input", input_text)
+        span.set_attribute("output", output_text)
+
+# --- Text Moderation ---
+if option == "Text Moderation":
+    user_input = st.text_area("Enter text")
+    if st.button("Analyze Text"):
+        result = cs_client.analyze_text(AnalyzeTextOptions(text=user_input))
+        log_trace("text_moderation", user_input, str(result))
+        st.write(result)
+
+# --- Image Moderation ---
+elif option == "Image Moderation":
+    uploaded = st.file_uploader("Upload an image", type=["jpg", "png"])
+    if uploaded:
+        image_bytes = uploaded.read()
+        result = cs_client.analyze_image(AnalyzeImageOptions(image=image_bytes))
+        log_trace("image_moderation", "image_uploaded", str(result))
+        st.image(image_bytes)
+        st.write(result)
+
+# --- Prompt Shield ---
+elif option == "Prompt Shield":
+    prompt = st.text_area("Enter prompt to shield")
+    if st.button("Shield Prompt"):
+        result = cs_client.analyze_text({
+            "text": prompt,
+            "categories": ["prompt_shield"]
+        })
+        log_trace("prompt_shield", prompt, str(result))
+        st.write(result)
+
+# --- Groundedness Check ---
+elif option == "Groundedness Check":
+    prompt = st.text_input("Prompt")
+    completion = st.text_area("Completion")
+    if st.button("Check Groundedness"):
+        payload = {
+            "prompt": prompt,
+            "completion": completion,
+            "checkFor": ["groundedness"]
+        }
+        result = cs_client.analyze_text(payload)
+        log_trace("groundedness_check", str(payload), str(result))
+        st.write(result)
+
+# --- Add to Blocklist ---
+elif option == "Add to Blocklist":
+    list_id = st.text_input("Blocklist ID")
+    text = st.text_input("Text to block")
+    if st.button("Add to Blocklist"):
+        items = [TextBlocklistItem(text=text)]
+        result = cs_client.add_or_update_text_blocklist_items(
+            blocklist_id=list_id,
+            options=AddOrUpdateTextBlocklistItemsOptions(items=items)
+        )
+        log_trace("blocklist_add", text, str(result))
+        st.success("Added to blocklist.")
+
+# --- Remove from Blocklist ---
+elif option == "Remove from Blocklist":
+    list_id = st.text_input("Blocklist ID")
+    item_id = st.text_input("Item ID")
+    if st.button("Remove from Blocklist"):
+        result = cs_client.remove_text_blocklist_items(
+            blocklist_id=list_id,
+            options=RemoveTextBlocklistItemsOptions(item_ids=[item_id])
+        )
+        log_trace("blocklist_remove", item_id, str(result))
+        st.success("Removed from blocklist.")
+
+# --- Foundry LLM Call ---
+elif option == "Call Foundry LLM":
+    prompt = st.text_area("Prompt to Foundry")
+    if st.button("Call Foundry Model"):
+        chat_input = {"messages": [{"role": "user", "content": prompt}]}
+        response = foundry_client.deployments.invoke(
+            deployment_name=FOUNDRY_DEPLOYMENT,
+            input=chat_input
+        )
+        result = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        log_trace("foundry_llm", prompt, result)
+        st.success("Foundry Response:")
+        st.write(result)
