@@ -1,0 +1,96 @@
+import streamlit as st
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
+
+# --- Azure setup ---
+st.set_page_config(page_title="Azure Content Safety Blocklist UI", layout="centered")
+
+st.title("🔒 Azure Content Safety – Blocklist Tester")
+st.markdown("Test blocklist creation, updating, and text matching using the Azure SDK v1.0.0")
+
+endpoint = st.sidebar.text_input("🔗 Azure Endpoint", value="", placeholder="https://<your-resource>.cognitiveservices.azure.com")
+key = st.sidebar.text_input("🔑 Azure API Key", type="password")
+
+if endpoint and key:
+    try:
+        client = ContentSafetyClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+        st.sidebar.success("Connected to Azure ✅")
+    except Exception as e:
+        st.sidebar.error(f"Connection failed: {e}")
+        st.stop()
+else:
+    st.sidebar.warning("Please enter endpoint and key to continue.")
+    st.stop()
+
+# --- Main app UI ---
+blocklist_name = st.text_input("📛 Blocklist Name", value="my-blocklist")
+action = st.selectbox("Choose Action", ["Create or Replace Blocklist", "Add Item", "View Items", "Match Text"])
+
+if action == "Create or Replace Blocklist":
+    st.subheader("🆕 Create or Replace Blocklist")
+    items_text = st.text_area("Enter one phrase per line to include in the blocklist:")
+    if st.button("Create Blocklist"):
+        blocklist_items = [{"text": line.strip()} for line in items_text.splitlines() if line.strip()]
+        try:
+            res = client.create_or_update_text_blocklist(
+                blocklist_name=blocklist_name,
+                description="Blocklist created via Streamlit",
+                blocklist_items=blocklist_items
+            )
+            st.success(f"Blocklist '{blocklist_name}' created/updated with {len(blocklist_items)} items.")
+        except HttpResponseError as e:
+            st.error(f"Azure Error: {e}")
+
+elif action == "Add Item":
+    st.subheader("➕ Add Item to Blocklist")
+    new_item = st.text_input("New Blocklist Item:")
+    if st.button("Add Item"):
+        try:
+            # Step 1: Get existing items
+            res = client.get_text_blocklist_items(blocklist_name=blocklist_name)
+            current_items = res.get("blocklist_items", [])
+            current_items.append({"text": new_item})
+
+            # Step 2: Recreate blocklist with updated items
+            client.create_or_update_text_blocklist(
+                blocklist_name=blocklist_name,
+                description=f"Updated blocklist '{blocklist_name}'",
+                blocklist_items=current_items
+            )
+            st.success(f"Added '{new_item}' to blocklist '{blocklist_name}'")
+        except HttpResponseError as e:
+            st.error(f"Azure Error: {e}")
+
+elif action == "View Items":
+    st.subheader("📄 View Blocklist Items")
+    if st.button("Fetch Blocklist Items"):
+        try:
+            res = client.get_text_blocklist_items(blocklist_name=blocklist_name)
+            items = res.get("blocklist_items", [])
+            if items:
+                for item in items:
+                    st.markdown(f"• `{item['text']}`")
+            else:
+                st.info("No items found in this blocklist.")
+        except HttpResponseError as e:
+            st.error(f"Azure Error: {e}")
+
+elif action == "Match Text":
+    st.subheader("🔍 Test Text Against Blocklist")
+    test_text = st.text_area("Enter text to test:")
+    if st.button("Match Text"):
+        try:
+            match_result = client.match_text(
+                blocklist_name=blocklist_name,
+                text=test_text
+            )
+            matches = match_result.get("blocklist_matches", [])
+            if matches:
+                st.warning("🔒 Match found!")
+                for match in matches:
+                    st.write(f"- `{match['blocklist_item_text']}` matched")
+            else:
+                st.success("✅ No blocklist matches found.")
+        except HttpResponseError as e:
+            st.error(f"Azure Error: {e}")
