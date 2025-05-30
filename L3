@@ -1,0 +1,102 @@
+import streamlit as st
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.core.credentials import AzureKeyCredential
+from azure.identity import DefaultAzureCredential
+from PIL import Image
+import base64
+import io
+import os
+
+# OpenTelemetry setup
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+
+# Set tracer provider
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+exporter = AzureMonitorTraceExporter(connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"))
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(exporter))
+
+# Azure Content Safety Client Setup
+endpoint = st.secrets.get("AZURE_CONTENT_SAFETY_ENDPOINT") or os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT")
+key = st.secrets.get("AZURE_CONTENT_SAFETY_KEY") or os.getenv("AZURE_CONTENT_SAFETY_KEY")
+
+client = ContentSafetyClient(endpoint=endpoint, credential=AzureKeyCredential(key))
+
+# UI
+st.title("🔐 Azure Content Safety – Full Tester (Python 3.13.1)")
+tab1, tab2, tab3, tab4 = st.tabs(["🧱 Blocklists", "🔠 Text Analysis", "🖼️ Image Moderation", "🛡️ Prompt Shield"])
+
+### -------------------- BLOCKLISTS --------------------
+with tab1:
+    st.subheader("🧱 Manage Blocklists")
+    blocklist_name = st.text_input("Blocklist Name")
+    action = st.selectbox("Action", ["Create Blocklist", "Add Item", "List Items", "Delete Blocklist", "Match Text"])
+    text_to_match = st.text_area("Text to match against blocklist") if action == "Match Text" else None
+    item_text = st.text_input("Item text to add") if action == "Add Item" else None
+
+    if st.button("Submit Blocklist Operation"):
+        with tracer.start_as_current_span("blocklist_operation"):
+            try:
+                if action == "Create Blocklist":
+                    res = client.create_or_update_text_blocklist({"blocklist_name": blocklist_name, "description": "Streamlit blocklist test"})
+                    st.success(f"Blocklist created: {res}")
+                elif action == "Add Item":
+                    res = client.add_or_update_text_blocklist_items({
+                        "blocklist_name": blocklist_name,
+                        "blocklist_items": [{"text": item_text}]
+                    })
+                    st.success(f"Item added: {res}")
+                elif action == "List Items":
+                    res = client.get_text_blocklist_items(blocklist_name=blocklist_name)
+                    st.json(res)
+                elif action == "Delete Blocklist":
+                    res = client.delete_text_blocklist(blocklist_name=blocklist_name)
+                    st.success("Blocklist deleted.")
+                elif action == "Match Text":
+                    res = client.match_text({"blocklist_names": [blocklist_name], "text": text_to_match})
+                    st.json(res)
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+### -------------------- TEXT ANALYSIS --------------------
+with tab2:
+    st.subheader("🔠 Analyze Text for Unsafe Content")
+    text_input = st.text_area("Enter text to analyze")
+    if st.button("Analyze Text"):
+        with tracer.start_as_current_span("analyze_text"):
+            try:
+                result = client.analyze_text({"text": text_input})
+                st.json(result)
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+### -------------------- IMAGE MODERATION --------------------
+with tab3:
+    st.subheader("🖼️ Moderate Image")
+    uploaded_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"])
+    if uploaded_file:
+        image_data = uploaded_file.read()
+        st.image(image_data, caption="Uploaded Image", use_column_width=True)
+
+        if st.button("Moderate Image"):
+            with tracer.start_as_current_span("moderate_image"):
+                try:
+                    result = client.analyze_image({"image": image_data})
+                    st.json(result)
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+
+### -------------------- PROMPT SHIELD --------------------
+with tab4:
+    st.subheader("🛡️ Analyze Prompt (Prompt Shield)")
+    prompt = st.text_area("Enter prompt to evaluate")
+    if st.button("Analyze Prompt"):
+        with tracer.start_as_current_span("prompt_shield"):
+            try:
+                result = client.analyze_prompt({"prompt": prompt})
+                st.json(result)
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
