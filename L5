@@ -1,0 +1,78 @@
+import os
+import streamlit as st
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.models import (
+    TextBlocklist,
+    AddOrUpdateTextBlocklistItemsOptions,
+    TextBlocklistItem,
+    AnalyzeTextOptions,
+)
+
+# Set up the Streamlit interface
+st.title("Azure Content Safety Blocklist Management")
+st.write("Interact with Azure Content Safety blocklists using the official SDK.")
+
+# Input fields for Azure credentials
+endpoint = st.text_input("Azure Endpoint", os.getenv("CONTENT_SAFETY_ENDPOINT", ""))
+api_key = st.text_input("API Key", os.getenv("CONTENT_SAFETY_KEY", ""), type="password")
+
+if not endpoint or not api_key:
+    st.warning("Please provide both the Azure Endpoint and API Key.")
+    st.stop()
+
+# Initialize the Content Safety client
+client = ContentSafetyClient(endpoint=endpoint, credential=AzureKeyCredential(api_key))
+
+# Select the operation to perform
+operation = st.selectbox("Select Operation", [
+    "Create or Update Blocklist",
+    "Add or Update Blocklist Items",
+    "List Blocklist Items",
+    "Analyze Text with Blocklist"
+])
+
+# Common input for blocklist name
+blocklist_name = st.text_input("Blocklist Name", "example_blocklist")
+
+if operation == "Create or Update Blocklist":
+    description = st.text_input("Blocklist Description", "Sample blocklist description")
+    if st.button("Create/Update Blocklist"):
+        blocklist = TextBlocklist(description=description)
+        try:
+            result = client.create_or_update_text_blocklist(blocklist_name=blocklist_name, options=blocklist)
+            st.success(f"Blocklist '{blocklist_name}' created or updated successfully.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+elif operation == "Add or Update Blocklist Items":
+    item_text = st.text_input("Blocklist Item Text", "sample term")
+    if st.button("Add/Update Item"):
+        blocklist_item = TextBlocklistItem(text=item_text)
+        options = AddOrUpdateTextBlocklistItemsOptions(blocklist_items=[blocklist_item])
+        try:
+            result = client.add_or_update_blocklist_items(blocklist_name=blocklist_name, options=options)
+            st.success(f"Item '{item_text}' added or updated in blocklist '{blocklist_name}'.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+elif operation == "List Blocklist Items":
+    if st.button("List Items"):
+        try:
+            items = client.list_text_blocklist_items(blocklist_name=blocklist_name)
+            st.write("Blocklist Items:")
+            for item in items:
+                st.write(f"- {item.text}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+elif operation == "Analyze Text with Blocklist":
+    text_to_analyze = st.text_area("Text to Analyze", "This is a sample text containing a sample term.")
+    if st.button("Analyze Text"):
+        options = AnalyzeTextOptions(text=text_to_analyze, blocklist_names=[blocklist_name])
+        try:
+            result = client.analyze_text(options=options)
+            st.write("Analysis Results:")
+            st.json(result.as_dict())
+        except Exception as e:
+            st.error(f"Error: {e}")
